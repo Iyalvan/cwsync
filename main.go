@@ -1,30 +1,30 @@
 package main
 
 import (
-	"fmt"
-	"log"
 	"os"
-	"strconv"
+	"path/filepath"
 	"strings"
 	"time"
+
+	"cwsync/internal/logger"
+	"cwsync/internal/offsetstore"
+	"cwsync/internal/tailer"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/cloudwatchlogs"
+	"github.com/aws/aws-sdk-go/service/dynamodb"
 	"github.com/hashicorp/consul/api"
 	"gopkg.in/yaml.v2"
 )
 
-var (
-	InfoLogger  *log.Logger
-	ErrorLogger *log.Logger
-	FatalLogger *log.Logger
-)
-
 type Config struct {
 	Consul                 ConsulConfig    `yaml:"consul"`
+	DynamoDB               DynamoDBConfig  `yaml:"dynamodb"`
+	File                   FileStoreConfig `yaml:"file"`
+	OffsetStore            string          `yaml:"offset_store"` // default store: "file", "consul" or "dynamodb"
 	AWSRegion              string          `yaml:"aws_region"`
 	AWSProfile             string          `yaml:"aws_profile"`
 	AWSRoleARN             string          `yaml:"aws_role_arn"`
@@ -39,11 +39,20 @@ type ConsulConfig struct {
 	Token   string `yaml:"token"`
 }
 
+type DynamoDBConfig struct {
+	TableName string `yaml:"table_name"`
+}
+
+type FileStoreConfig struct {
+	Path string `yaml:"path"`
+}
+
 type ServiceConfig struct {
 	Name         string      `yaml:"name"`
 	ConsulKVPath string      `yaml:"consul_kv_path"`
 	LogConfigs   []LogConfig `yaml:"log_configs"`
 	Destination  Destination `yaml:"destination"`
+	OffsetStore  string      `yaml:"offset_store"` // "consul" (default) or "dynamodb"
 }
 
 type LogConfig struct {
@@ -57,33 +66,92 @@ type Destination struct {
 	FileName string `yaml:"file_name"`
 }
 
-func init() {
-	InfoLogger = log.New(os.Stdout, "", log.Ldate|log.Ltime)
-	ErrorLogger = log.New(os.Stderr, "", log.Ldate|log.Ltime)
-	FatalLogger = log.New(os.Stderr, "", log.Ldate|log.Ltime)
-}
-
 func main() {
 	configPath := os.Getenv("CONFIG_PATH")
 	if configPath == "" {
 		configPath = "config.yaml"
 	}
 	config := loadConfig(configPath)
+	applyEnvOverrides(&config)
 	sess := createAWSSession(config)
-	consulClient := setupConsulClient(config.Consul)
+	// Lazily initialize stores/clients only if needed
+	var consulClient *api.Client
+	var dynamoClient *dynamodb.DynamoDB
+	var fileStore *offsetstore.FileOffsetStore
+	// Determine which stores are needed across services
+	storesNeeded := map[string]bool{}
+	for _, svc := range config.Services {
+		st := strings.ToLower(strings.TrimSpace(svc.OffsetStore))
+		if st == "" {
+			st = strings.ToLower(strings.TrimSpace(config.OffsetStore))
+		}
+		if st == "" {
+			st = "file"
+		}
+		storesNeeded[st] = true
+	}
+	if storesNeeded["file"] {
+		filePath := config.File.Path
+		if strings.TrimSpace(filePath) == "" {
+			if exe, err := os.Executable(); err == nil {
+				filePath = filepath.Join(filepath.Dir(exe), "offsetstore.json")
+			} else {
+				filePath = "offsetstore.json"
+			}
+		}
+		fileStore = offsetstore.NewFileOffsetStore(filePath)
+	}
+	if storesNeeded["consul"] {
+		consulClient = setupConsulClient(config.Consul)
+	}
+	if storesNeeded["dynamodb"] {
+		dynamoClient = dynamodb.New(sess)
+	}
 	OffsetFallbackDuration := config.OffsetFallbackDuration
 
 	for _, service := range config.Services {
 		cwLogs := cloudwatchlogs.New(sess)
 
 		for _, logConfig := range service.LogConfigs {
-			logStreams, err := listLogStreams(cwLogs, logConfig.LogGroupName, logConfig.LogStreamPrefix)
+			logStreams, err := tailer.ListLogStreams(cwLogs, logConfig.LogGroupName, logConfig.LogStreamPrefix)
 			if err != nil {
-				FatalLogger.Fatalf("failed to list log streams for %s: %v", service.Name, err)
+				logger.Fatal.Fatalf("failed to list log streams for %s: %v", service.Name, err)
+			}
+
+			// pick store for this service
+			storeType := strings.ToLower(strings.TrimSpace(service.OffsetStore))
+			if storeType == "" {
+				storeType = strings.ToLower(strings.TrimSpace(config.OffsetStore))
+			}
+			if storeType == "" {
+				storeType = "file"
+			}
+			var offsetStore offsetstore.OffsetStore
+			switch storeType {
+			case "file":
+				if fileStore == nil {
+					logger.Fatal.Fatalf("file offset store requested but not initialized")
+				}
+				offsetStore = fileStore
+			case "dynamodb":
+				if dynamoClient == nil {
+					logger.Fatal.Fatalf("dynamodb offset store requested but dynamodb client not initialized")
+				}
+				if strings.TrimSpace(config.DynamoDB.TableName) == "" {
+					logger.Fatal.Fatalf("dynamodb offset store requires 'dynamodb.table_name' in config or env")
+				}
+				offsetStore = &offsetstore.DynamoDBOffsetStore{Client: dynamoClient, TableName: config.DynamoDB.TableName}
+			case "consul":
+				fallthrough
+			default:
+				if consulClient == nil {
+					logger.Fatal.Fatalf("consul offset store requested but consul client not initialized")
+				}
+				offsetStore = &offsetstore.ConsulOffsetStore{Client: consulClient}
 			}
 
 			for _, stream := range logStreams {
-				go tailLogStream(cwLogs, service, logConfig, stream, consulClient, OffsetFallbackDuration)
+				go tailer.TailLogStream(cwLogs, service.ConsulKVPath, logConfig.LogGroupName, stream, offsetStore, OffsetFallbackDuration)
 			}
 		}
 	}
@@ -94,12 +162,12 @@ func main() {
 func loadConfig(path string) Config {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		FatalLogger.Fatalf("failed to read config file: %v", err)
+		logger.Fatal.Fatalf("failed to read config file: %v", err)
 	}
 
 	var config Config
 	if err := yaml.Unmarshal(data, &config); err != nil {
-		FatalLogger.Fatalf("failed to unmarshal config file: %v", err)
+		logger.Fatal.Fatalf("failed to unmarshal config file: %v", err)
 	}
 	return config
 }
@@ -110,7 +178,7 @@ func setupConsulClient(consulConfig ConsulConfig) *api.Client {
 	config.Token = consulConfig.Token
 	client, err := api.NewClient(config)
 	if err != nil {
-		FatalLogger.Fatalf("failed to create Consul client: %v", err)
+		logger.Fatal.Fatalf("failed to create Consul client: %v", err)
 	}
 	return client
 }
@@ -140,106 +208,42 @@ func createAWSSession(config Config) *session.Session {
 	return session.Must(session.NewSessionWithOptions(sessOptions))
 }
 
-func listLogStreams(cwLogs *cloudwatchlogs.CloudWatchLogs, logGroupName, logStreamPrefix string) ([]string, error) {
-	var logStreams []string
-	err := cwLogs.DescribeLogStreamsPages(&cloudwatchlogs.DescribeLogStreamsInput{
-		LogGroupName:        aws.String(logGroupName),
-		LogStreamNamePrefix: aws.String(logStreamPrefix),
-	}, func(page *cloudwatchlogs.DescribeLogStreamsOutput, lastPage bool) bool {
-		for _, stream := range page.LogStreams {
-			if strings.HasPrefix(*stream.LogStreamName, logStreamPrefix) {
-				logStreams = append(logStreams, *stream.LogStreamName)
-			}
-		}
-		return !lastPage
-	})
-
-	if err != nil {
-		return nil, err
+func applyEnvOverrides(cfg *Config) {
+	if v := os.Getenv("CWSYNC_OFFSET_STORE"); v != "" {
+		cfg.OffsetStore = v
 	}
-	return logStreams, nil
-}
-
-func tailLogStream(cwLogs *cloudwatchlogs.CloudWatchLogs, service ServiceConfig, logConfig LogConfig, logStreamName string, consulClient *api.Client, OffsetFallbackDuration time.Duration) {
-	OffsetPath := service.ConsulKVPath + "/" + logStreamName
-	lastTimestamp := loadOffsetFromConsul(consulClient, OffsetPath, OffsetFallbackDuration)
-	//InfoLogger.Printf("Starting to tail log stream %s from timestamp %d", logStreamName, lastTimestamp)
-	InfoLogger.Printf("Starting to tail log stream %s from timestamp %d (%s)", logStreamName, lastTimestamp, time.Unix(lastTimestamp/1000, 0).Format(time.RFC3339))
-	retryDelay := 10 * time.Second
-	maxRetryDelay := 5 * time.Minute
-
-	var nextToken *string
-
-	for {
-		params := &cloudwatchlogs.GetLogEventsInput{
-			LogGroupName:  aws.String(logConfig.LogGroupName),
-			LogStreamName: aws.String(logStreamName),
-			StartTime:     aws.Int64(lastTimestamp),
-			StartFromHead: aws.Bool(true),
-			Limit:         aws.Int64(500),
-			NextToken:     nextToken,
-		}
-
-		resp, err := cwLogs.GetLogEvents(params)
-
-		if err != nil {
-			ErrorLogger.Printf("Error getting log events for stream %s: %v", logStreamName, err)
-			time.Sleep(60 * time.Second)
-			continue
-		}
-
-		if len(resp.Events) > 0 {
-			for _, event := range resp.Events {
-				InfoLogger.Printf("[%s] %s\n", logStreamName, *event.Message)
-			}
-			lastTimestamp = *resp.Events[len(resp.Events)-1].Timestamp
-			err = saveOffsetToConsul(consulClient, OffsetPath, lastTimestamp)
-			if err != nil {
-				FatalLogger.Printf("Error saving offset to Consul: %v", err)
-			}
-			nextToken = resp.NextForwardToken
-			retryDelay = 10 * time.Second
+	if v := os.Getenv("CWSYNC_OFFSET_FILE"); v != "" {
+		cfg.File.Path = v
+	}
+	if v := os.Getenv("CWSYNC_AWS_REGION"); v != "" {
+		cfg.AWSRegion = v
+	}
+	if v := os.Getenv("CWSYNC_AWS_PROFILE"); v != "" {
+		cfg.AWSProfile = v
+	}
+	if v := os.Getenv("CWSYNC_AWS_ROLE_ARN"); v != "" {
+		cfg.AWSRoleARN = v
+	}
+	if v := os.Getenv("CWSYNC_AWS_ACCESS_KEY"); v != "" {
+		cfg.AWSAccessKey = v
+	}
+	if v := os.Getenv("CWSYNC_AWS_SECRET_KEY"); v != "" {
+		cfg.AWSSecretKey = v
+	}
+	if v := os.Getenv("CWSYNC_CONSUL_ADDR"); v != "" {
+		cfg.Consul.Address = v
+	}
+	if v := os.Getenv("CWSYNC_CONSUL_TOKEN"); v != "" {
+		cfg.Consul.Token = v
+	}
+	if v := os.Getenv("CWSYNC_DYNAMODB_TABLE"); v != "" {
+		cfg.DynamoDB.TableName = v
+	}
+	if v := os.Getenv("CWSYNC_OFFSET_FALLBACK_DURATION"); v != "" {
+		if dur, err := time.ParseDuration(v); err == nil {
+			cfg.OffsetFallbackDuration = dur
 		} else {
-			if nextToken != nil && *resp.NextForwardToken == *nextToken {
-				lastTimestamp += 1
-				nextToken = nil
-			} else {
-				nextToken = resp.NextForwardToken
-				continue
-			}
-			time.Sleep(retryDelay)
-			if retryDelay < maxRetryDelay {
-				retryDelay *= 2
-			}
+			logger.Error.Printf("Invalid CWSYNC_OFFSET_FALLBACK_DURATION '%s': %v", v, err)
 		}
 	}
-}
-
-func saveOffsetToConsul(consulClient *api.Client, kvPath string, lastTimestamp int64) error {
-	kvPair := &api.KVPair{
-		Key:   kvPath,
-		Value: []byte(fmt.Sprintf("%d", lastTimestamp)),
-	}
-	_, err := consulClient.KV().Put(kvPair, nil)
-	return err
-}
-
-func loadOffsetFromConsul(consulClient *api.Client, kvPath string, OffsetFallbackDuration time.Duration) int64 {
-	var lastTimestamp int64
-	kvPair, _, err := consulClient.KV().Get(kvPath, nil)
-	if err != nil {
-		FatalLogger.Fatalf("Failed to load offset from Consul: %v", err)
-	}
-
-	if kvPair == nil {
-		InfoLogger.Printf("Offset not found in Consul, using default timestamp of %s", OffsetFallbackDuration)
-		return time.Now().UTC().Add(-OffsetFallbackDuration).UnixMilli()
-	} else {
-		lastTimestamp, err = strconv.ParseInt(string(kvPair.Value), 10, 64)
-		if err != nil {
-			FatalLogger.Fatalf("Failed to parse offset from Consul: %v", err)
-		}
-	}
-
-	return lastTimestamp
 }
