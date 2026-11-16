@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -18,6 +19,7 @@ import (
 )
 
 var (
+	EventLogger *log.Logger
 	InfoLogger  *log.Logger
 	ErrorLogger *log.Logger
 	FatalLogger *log.Logger
@@ -57,8 +59,18 @@ type Destination struct {
 	FileName string `yaml:"file_name"`
 }
 
+// logEvent is the one line written to stdout for each cloudwatch event
+type logEvent struct {
+	Stream        string `json:"stream"`
+	Timestamp     int64  `json:"timestamp"`
+	IngestionTime int64  `json:"ingestion_time"`
+	Message       string `json:"message"`
+}
+
 func init() {
-	InfoLogger = log.New(os.Stdout, "", log.Ldate|log.Ltime)
+	// stdout carries only events, so a shipper can parse it line by line
+	EventLogger = log.New(os.Stdout, "", 0)
+	InfoLogger = log.New(os.Stderr, "", log.Ldate|log.Ltime)
 	ErrorLogger = log.New(os.Stderr, "", log.Ldate|log.Ltime)
 	FatalLogger = log.New(os.Stderr, "", log.Ldate|log.Ltime)
 }
@@ -190,7 +202,7 @@ func tailLogStream(cwLogs *cloudwatchlogs.CloudWatchLogs, service ServiceConfig,
 
 		if len(resp.Events) > 0 {
 			for _, event := range resp.Events {
-				InfoLogger.Printf("[%s] %s\n", logStreamName, *event.Message)
+				emitEvent(logStreamName, event)
 			}
 			lastTimestamp = *resp.Events[len(resp.Events)-1].Timestamp
 			err = saveOffsetToConsul(consulClient, OffsetPath, lastTimestamp)
@@ -213,6 +225,17 @@ func tailLogStream(cwLogs *cloudwatchlogs.CloudWatchLogs, service ServiceConfig,
 			}
 		}
 	}
+}
+
+func emitEvent(logStreamName string, event *cloudwatchlogs.OutputLogEvent) {
+	// newlines in the message are escaped, so a multi-line record stays on one line
+	line, _ := json.Marshal(logEvent{ // only strings and integers, so it cannot fail
+		Stream:        logStreamName,
+		Timestamp:     aws.Int64Value(event.Timestamp),
+		IngestionTime: aws.Int64Value(event.IngestionTime),
+		Message:       aws.StringValue(event.Message),
+	})
+	EventLogger.Println(string(line))
 }
 
 func saveOffsetToConsul(consulClient *api.Client, kvPath string, lastTimestamp int64) error {

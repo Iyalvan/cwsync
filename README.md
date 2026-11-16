@@ -8,18 +8,18 @@ The **cwsync** is a go based application to export logs from AWS cloudwatch to c
 
 In AWS cloud envs, services like AWS RDS, lambda, and load balancers automatically send logs to cloudwatch.  many other services used by differetn org, such as elasticsearch/opensearch for application logs and tools running in container orchestrators like kubernetes and nomad, do not.
 
-The **cwsync** addresses this gap by exporting logs from cloudWatch to centralized/different log storage solutions like to a file (s) or kafka or elasticsearch , where they can be further processed or analyzed. This is particularly useful when you dont need to export AWS cloudwatch servces by relying solely on AWS services like Lambda and SQS using [elastic-serverless-forwarder](https://github.com/elastic/elastic-serverless-forwarder), instead opting to tail logs and output them to stdout, log files, or other destinations like kafka.
+The **cwsync** addresses this gap by tailing logs from cloudWatch and writing each event to stdout as one json line, where a shipper such as [vector](https://vector.dev) can forward it to centralized log storage like files, kafka or elasticsearch for further processing or analysis. This is particularly useful when you dont need to export AWS cloudwatch servces by relying solely on AWS services like Lambda and SQS using [elastic-serverless-forwarder](https://github.com/elastic/elastic-serverless-forwarder), instead opting to tail logs and output them to stdout.
 
 Key features of this include:
 
 - **centralized log management**: consolidate logs from various sources into a single storage system.
 - **offset Management**: utilize [consul KV](https://developer.hashicorp.com/consul/docs/dynamic-app-config/kv) to store the offset of the cloudwatch log stream, ensuring consistent log processing without loss or duplication.
-- **customizable output**: tail logs and output them in a format that can be consumed by tools like [vector](https://vector.dev) for synchronization with [Elasticsearch](https://www.elastic.co/elasticsearch) or [kafka](https://kafka.apache.org/documentation/).
+- **simple output**: one json object per event on stdout, ready for tools like [vector](https://vector.dev) to forward to [Elasticsearch](https://www.elastic.co/elasticsearch) or [kafka](https://kafka.apache.org/documentation/).
 
 ## features
 
 - multi-service support for exporting logs from AWS and custom applications.
-- support for various log storage destinations, including files, stdout, kafka and elasticsearch.
+- one json object per event on stdout; a shipper such as vector forwards it to files, kafka or elasticsearch.
 - offset management using consul KV to ensure logs are processed consistently and to ensure delivery atleast once.
 - concurrent processing of multiple log streams for efficiency.
 - configuration through a YAML file.
@@ -27,12 +27,12 @@ Key features of this include:
 ## architecture
 
 
-1. **configuration loading**: settings are loaded from a YAML file, including AWS credentials, service details, and log destinations.
+1. **configuration loading**: settings are loaded from a YAML file, including AWS credentials and service details.
 2. **consul client setup**: connection to consul is established to manage and persist log stream offsets.
 3. **log stream discovery**: relevant log streams are discovered based on the provided configuration.
 4. **log taling**: Goroutines are initiated to fetch and process log events in real-time.
 5. **offset management**: processed logs are saved back to consul KV store to maintain state across restarts.
-6. **log output**: logs are output to specified destinations for further consumption or analysis.
+6. **log output**: each event is written to stdout as one json line; diagnostics go to stderr.
 
 ## prerequisites
 
@@ -40,7 +40,7 @@ before deploying and running the **cwsync**, ensure the following:
 
 - **AWS Credentials**: AWS creds with appropriate permissions to access cloudwatch Logs.
 - **consul**: A running consul instance accessible for offset management.
-- **log storage and management**: Access to desired log storage systems like Elasticsearch, Kafka, or file systems.
+- **a log shipper**: a tool that reads cwsync's stdout and forwards it, such as vector.
 
 ## configuration
 
@@ -63,10 +63,6 @@ services:
     log_configs:
       - log_group_name: "/aws/lambda/my-function"
         log_stream_prefix: "function-name"
-    destination:
-      type: "file"
-      file_path: "/var/logs/my-service"
-      file_name: "logs.txt"
 ```
 ### configuration parameters
 - consul configuration:
@@ -82,8 +78,23 @@ services:
   - name: identifier for the service.
   - consul_kv_path: consul KV path for saving log offsets.
   - log_configs: list of log groups and streams to monitor.
-  - destination: defines where to output logs (e.g., file, stdout).
 
+## output
+
+each cloudwatch event is written to stdout as one json object per line. everything else (startup notes, errors) goes to stderr, so stdout is safe to read line by line.
+
+```json
+{"stream":"my-stream","timestamp":1730000000000,"ingestion_time":1730000001000,"message":"raw event text"}
+```
+
+| field | meaning |
+|---|---|
+| stream | log stream name |
+| timestamp | event time in epoch milliseconds, set by the producer |
+| ingestion_time | when cloudwatch received the event, in epoch milliseconds |
+| message | the event text, unchanged. newlines stay escaped inside the string, so a multi-line record is still one line |
+
+delivery is at least once: after a restart an event can be written again.
 
 ## usage
 
